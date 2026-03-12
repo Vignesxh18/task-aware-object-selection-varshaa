@@ -1,93 +1,129 @@
+import os
+
+import clip
 import cv2
-import numpy as np
 import torch
-from transformers import CLIPModel, CLIPProcessor
+from PIL import Image
 from ultralytics import YOLO
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load models
-yolo = YOLO("yolov8n.pt")
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# load models
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
+yolo_model = YOLO("yolov8n.pt")
 
-def get_text_embedding(task):
-    inputs = processor(text=task, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+# input image
+image_folder = "val2017"
+image_file = input("Enter COCO image filename: ")
+
+image_path = os.path.join(image_folder, image_file)
+
+if not os.path.exists(image_path):
+    print("Image not found")
+    exit()
+
+image = Image.open(image_path)
+image_cv = cv2.imread(image_path)
+
+print("\nUsing image:", image_file)
+
+# task input
+task_prompt = input("Enter task (example: serve wine, sit, read, drink): ")
+
+print("\nTask:", task_prompt)
+
+# -----------------------------
+# Step 1 YOLO detection
+# -----------------------------
+
+results = yolo_model(image_path)
+
+objects = []
+boxes = []
+scores = []
+
+for r in results:
+    for box in r.boxes:
+
+        cls_id = int(box.cls)
+        conf = float(box.conf)
+
+        obj = yolo_model.names[cls_id]
+
+        if conf > 0.30:
+
+            objects.append(obj)
+            boxes.append(box.xyxy[0])
+
+print("\nDetected Objects:")
+
+for o in objects:
+    print(o)
+
+# -----------------------------
+# Step 2 task scoring
+# -----------------------------
+
+clip_scores = []
+
+for obj,box in zip(objects,boxes):
+
+    x1,y1,x2,y2 = map(int,box)
+
+    crop = image.crop((x1,y1,x2,y2))
+
+    image_input = preprocess(crop).unsqueeze(0).to(device)
+
+    prompt = f"best object to {task_prompt}"
+
+    text = clip.tokenize([prompt]).to(device)
 
     with torch.no_grad():
-        text_outputs = clip_model.text_model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"]
-        )
-        pooled = text_outputs.pooler_output
-        text_features = clip_model.text_projection(pooled)
 
-    return text_features / text_features.norm(dim=-1, keepdim=True)
+        image_features = clip_model.encode_image(image_input)
+        text_features = clip_model.encode_text(text)
 
-def get_image_embedding(image_crop):
-    image_rgb = cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB)
-    inputs = processor(images=image_rgb, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+        image_features /= image_features.norm(dim=-1, keepdim=True)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
 
-    with torch.no_grad():
-        vision_outputs = clip_model.vision_model(
-            pixel_values=inputs["pixel_values"]
-        )
+        similarity = image_features @ text_features.T
 
-        pooled_output = vision_outputs.pooler_output
-        image_features = clip_model.visual_projection(pooled_output)
+    score = similarity.cpu().numpy()[0][0]
 
-    # normalize
-    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+    clip_scores.append(score)
 
-    return image_features
+print("\nTask Relevance Scores:")
 
-def main():
-    image_path = "sample.jpg"
-    task = input("Enter task: ")
+for o,s in zip(objects,clip_scores):
+    print(o,"→",round(s,3))
 
-    text_embedding = get_text_embedding(task)
+# -----------------------------
+# Step 3 select best object
+# -----------------------------
 
-    results = yolo(image_path)
-    image = cv2.imread(image_path)
+best_index = clip_scores.index(max(clip_scores))
 
-    best_score = -1
-    best_label = None
-    best_box = None
+selected_object = objects[best_index]
+best_box = boxes[best_index]
 
-    for box in results[0].boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        label = yolo.names[int(box.cls)]
+print("\nFINAL RESULT")
+print("Task:",task_prompt)
+print("Selected Object:",selected_object)
 
-        crop = image[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
+# -----------------------------
+# Step 4 visualize result
+# -----------------------------
 
-        image_embedding = get_image_embedding(crop)
-        similarity = torch.cosine_similarity(text_embedding, image_embedding)
-        score = similarity.item()
+x1,y1,x2,y2 = map(int,best_box)
 
-        print(f"{label} -> {score:.4f}")
+cv2.rectangle(image_cv,(x1,y1),(x2,y2),(0,255,0),3)
 
-        if score > best_score:
-            best_score = score
-            best_label = label
-            best_box = (x1, y1, x2, y2)
+label = f"{task_prompt} → {selected_object}"
 
-    print("\nSelected Object:", best_label)
-    print("Similarity Score:", best_score)
+cv2.putText(image_cv,label,(x1,y1-10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,(0,255,0),2)
 
-    # Draw bounding box
-    if best_box:
-        x1, y1, x2, y2 = best_box
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3)
-        cv2.putText(image, best_label, (x1, y1-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                    (0, 255, 0), 2)
+cv2.imwrite("output.jpg",image_cv)
 
-        cv2.imwrite("output.jpg", image)
-        print("Saved result as output.jpg")
-
-if __name__ == "__main__":
-    main()
+print("\nSaved output image as output.jpg")
