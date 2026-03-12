@@ -1,23 +1,30 @@
+import clip
 import torch
-from transformers import CLIPModel, CLIPProcessor
+from PIL import Image
 
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+model, preprocess = clip.load("ViT-B/32", device=device)
 
-task = "person riding skateboard"
+image = preprocess(Image.open("sample.jpg")).unsqueeze(0).to(device)
 
-inputs = processor(text=task, return_tensors="pt", padding=True)
-inputs = {k: v.to(device) for k, v in inputs.items()}
+texts = [
+    "a person walking",
+    "a car on the road",
+    "a person riding skateboard"
+]
+
+text_tokens = clip.tokenize(texts).to(device)
 
 with torch.no_grad():
-    text_outputs = model.text_model(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"]
-    )
+    image_features = model.encode_image(image)
+    text_features = model.encode_text(text_tokens)
 
-    pooled_output = text_outputs.pooler_output
-    text_features = model.text_projection(pooled_output)
+similarity = (image_features @ text_features.T).softmax(dim=-1)
 
-print("Text embedding shape:", text_features.shape)
+scores = similarity.cpu().numpy()[0]
+
+print("\nCLIP Similarity Scores:")
+
+for t, s in zip(texts, scores):
+    print(f"{t} → {s:.3f}")
